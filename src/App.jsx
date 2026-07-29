@@ -15,6 +15,12 @@ import {
 } from "lucide-react";
 import {
   isConfigured,
+  getExistingUser,
+  continueAsGuest,
+  signInWithGoogle,
+  linkGoogleAccount,
+  getAccountInfo,
+  signOut,
   loadProfile,
   createProfile as createProfileRow,
   updateProfile,
@@ -237,6 +243,22 @@ const THEME = {
 function getDateStr(d = new Date()) {
   return d.toISOString().slice(0, 10);
 }
+
+/*
+  Google sign-in and account-linking both redirect back with the outcome
+  encoded in the URL rather than as a normal return value — Supabase puts
+  errors (e.g. linking a Google identity that's already tied to another
+  account) in the query string or hash as `error_description`. Read it
+  once on mount and strip it so a refresh doesn't re-show a stale error.
+*/
+function consumeAuthRedirectError() {
+  const params = new URLSearchParams(window.location.search || window.location.hash.replace(/^#/, ""));
+  const description = params.get("error_description");
+  if (!description) return null;
+  const clean = window.location.origin + window.location.pathname;
+  window.history.replaceState(null, "", clean);
+  return description.replace(/\+/g, " ");
+}
 function parseDateStr(s) {
   const [y, m, d] = s.split("-").map(Number);
   return new Date(y, m - 1, d);
@@ -261,9 +283,11 @@ function formatDayLabel(s) {
 
 export default function DailyBriefApp() {
   const [loading, setLoading] = useState(true);
+  const [needsAuthChoice, setNeedsAuthChoice] = useState(false);
   const [needsName, setNeedsName] = useState(false);
   const [nameInput, setNameInput] = useState("");
   const [profile, setProfile] = useState(null);
+  const [accountInfo, setAccountInfo] = useState(null);
 
   const todayStr = getDateStr(new Date());
   const [viewDate, setViewDate] = useState(todayStr);
@@ -281,7 +305,7 @@ export default function DailyBriefApp() {
 
   const startRef = useRef(null);
   const timerRef = useRef(null);
-  const didMountRef = useRef(false);
+  const prevViewDateRef = useRef(todayStr);
 
   const theme = profile?.theme || "light";
   const t = THEME[theme];
@@ -305,36 +329,90 @@ export default function DailyBriefApp() {
   const totalCompleted = historyEntries.length;
   const longestStreak = Math.max(profile?.bestStreak || 0, profile?.streak || 0);
 
-  // initial load
+  // Runs once a session (guest or Google) is confirmed to exist — loads
+  // whatever's tied to that account, or asks for a name if this is its
+  // first time here.
+  const afterAuth = async () => {
+    try {
+      const [p, info] = await Promise.all([loadProfile(), getAccountInfo()]);
+      setAccountInfo(info);
+      if (p) {
+        setProfile(p);
+        const entry = p.history && p.history[todayStr];
+        if (entry) {
+          setValues(entry.values || {});
+          loadFeed(todayStr);
+        }
+      } else {
+        setNeedsName(true);
+      }
+    } catch (e) {
+      setError(e?.message || "Couldn't reach the server.");
+    } finally {
+      setLoading(false);
+      setNeedsAuthChoice(false);
+    }
+  };
+
+  // initial load: only proceed straight into the app if a session already
+  // exists (a returning guest or a signed-in user, including landing back
+  // here right after a Google redirect) — otherwise ask which one to start.
   useEffect(() => {
     (async () => {
       try {
-        const p = await loadProfile();
-        if (p) {
-          setProfile(p);
-          const entry = p.history && p.history[todayStr];
-          if (entry) {
-            setValues(entry.values || {});
-            loadFeed(todayStr);
-          }
-        } else {
-          setNeedsName(true);
+        const redirectError = consumeAuthRedirectError();
+        if (redirectError) setError(redirectError);
+
+        const user = await getExistingUser();
+        if (!user) {
+          setNeedsAuthChoice(true);
+          setLoading(false);
+          return;
         }
+        await afterAuth();
       } catch (e) {
         setError(e?.message || "Couldn't reach the server.");
-      } finally {
         setLoading(false);
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // when the viewed date changes (after the initial mount), reset the form/timer
-  useEffect(() => {
-    if (!didMountRef.current) {
-      didMountRef.current = true;
-      return;
+  const chooseGuest = async () => {
+    setError("");
+    setLoading(true);
+    try {
+      await continueAsGuest();
+      await afterAuth();
+    } catch (e) {
+      setError(e?.message || "Couldn't continue as guest.");
+      setLoading(false);
     }
+  };
+
+  const chooseGoogle = () => {
+    setError("");
+    signInWithGoogle();
+  };
+
+  const upgradeToGoogle = () => {
+    linkGoogleAccount();
+  };
+
+  const handleSignOut = async () => {
+    await signOut();
+    window.location.reload();
+  };
+
+  // when the viewed date changes (after the initial mount), reset the form/timer.
+  // Compares against the previous value rather than an effect-ran-once flag —
+  // the latter breaks under React StrictMode's dev-mode double-invoke, which
+  // fires this on mount too and would wipe state (like a fresh auth error)
+  // the very effect right after it just set.
+  useEffect(() => {
+    if (prevViewDateRef.current === viewDate) return;
+    prevViewDateRef.current = viewDate;
+
     if (timerRef.current) clearInterval(timerRef.current);
     startRef.current = null;
     setElapsed(0);
@@ -544,6 +622,35 @@ export default function DailyBriefApp() {
     );
   }
 
+  if (needsAuthChoice) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-stone-50 px-6">
+        <div className="max-w-sm w-full">
+          <h1 className="text-2xl font-semibold text-stone-900 mb-2">Daily Brief</h1>
+          <p className="text-stone-500 mb-6 text-sm">
+            A daily copywriting brief, same for everyone, written against the clock.
+          </p>
+          <button
+            onClick={chooseGoogle}
+            className="w-full bg-stone-900 text-white rounded-lg py-3 font-medium hover:bg-stone-800 mb-3"
+          >
+            Sign in with Google
+          </button>
+          <button
+            onClick={chooseGuest}
+            className="w-full border border-stone-300 text-stone-700 rounded-lg py-3 font-medium hover:bg-stone-100"
+          >
+            Continue as guest
+          </button>
+          <p className="text-xs text-stone-400 mt-4">
+            Guest progress stays on this device only. Sign in to keep your streak across devices.
+          </p>
+          {error && <p className="text-sm text-red-500 mt-3">{error}</p>}
+        </div>
+      </div>
+    );
+  }
+
   if (needsName) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-stone-50 px-6">
@@ -616,6 +723,15 @@ export default function DailyBriefApp() {
             </button>
           </div>
         </header>
+
+        {error && (
+          <div className={`flex items-start justify-between gap-3 rounded-lg px-4 py-3 mb-6 text-sm ${t.notChip}`}>
+            <span>{error}</span>
+            <button onClick={() => setError("")} className="shrink-0 opacity-70 hover:opacity-100">
+              <X size={16} />
+            </button>
+          </div>
+        )}
 
         <div className="flex gap-2 overflow-x-auto pb-2 mb-6">
           {pastDays.map((d) => {
@@ -737,7 +853,6 @@ export default function DailyBriefApp() {
                 Backfilling a past day joins that day's room but won't affect your streak.
               </p>
             )}
-            {error && <p className="text-sm text-red-500">{error}</p>}
           </div>
         ) : (
           <div>
@@ -830,6 +945,35 @@ export default function DailyBriefApp() {
                 <X size={20} />
               </button>
             </div>
+
+            <section className="mb-8">
+              <h3 className={`text-xs uppercase tracking-wide ${t.muted} mb-3`}>Account</h3>
+              {accountInfo?.isGuest ? (
+                <div className={`rounded-lg p-3 ${t.statBox}`}>
+                  <p className={`text-sm ${t.text} mb-2`}>
+                    Playing as a guest — your streak only lives on this device.
+                  </p>
+                  <button
+                    onClick={upgradeToGoogle}
+                    className={`w-full rounded-lg py-2 text-sm font-medium ${t.buttonPrimary}`}
+                  >
+                    Save progress with Google
+                  </button>
+                </div>
+              ) : (
+                <div className={`rounded-lg p-3 ${t.statBox}`}>
+                  <p className={`text-sm ${t.text} mb-2`}>
+                    Signed in as {accountInfo?.email || "…"}
+                  </p>
+                  <button
+                    onClick={handleSignOut}
+                    className={`w-full rounded-lg py-2 text-sm font-medium border ${t.toggleUnselected}`}
+                  >
+                    Sign out
+                  </button>
+                </div>
+              )}
+            </section>
 
             <section className="mb-8">
               <h3 className={`flex items-center gap-2 text-xs uppercase tracking-wide ${t.muted} mb-3`}>

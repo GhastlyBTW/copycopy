@@ -8,17 +8,56 @@ export const isConfigured = Boolean(url && anonKey);
 const supabase = isConfigured ? createClient(url, anonKey) : null;
 
 /*
-  Every visitor is signed in anonymously, which gives them a stable
-  auth.uid() across reloads and devices-with-the-same-session without
-  asking for an email. All RLS policies key off that id.
+  Two ways to get a session: `continueAsGuest` (anonymous — stable across
+  reloads on this device via localStorage, but not across devices) or
+  `signInWithGoogle` (a real identity, portable across devices). Either
+  way, everything below just needs *a* session to already exist — it
+  doesn't care which kind.
 */
-async function requireUser() {
-  const { data: sessionData } = await supabase.auth.getSession();
-  if (sessionData.session) return sessionData.session.user;
+async function currentUser() {
+  const { data } = await supabase.auth.getSession();
+  if (!data.session) throw new Error("Not signed in.");
+  return data.session.user;
+}
 
+// Null means this browser has no session at all yet — caller should show
+// the guest-or-sign-in choice rather than assuming anonymous.
+export async function getExistingUser() {
+  const { data } = await supabase.auth.getSession();
+  return data.session ? data.session.user : null;
+}
+
+export async function continueAsGuest() {
   const { data, error } = await supabase.auth.signInAnonymously();
   if (error) throw error;
   return data.user;
+}
+
+// Full-page redirect to Google and back — nothing to await here.
+export function signInWithGoogle() {
+  const redirectTo = window.location.origin + window.location.pathname;
+  return supabase.auth.signInWithOAuth({ provider: "google", options: { redirectTo } });
+}
+
+/*
+  Turns the current anonymous session into a real one, keeping the same
+  auth.uid() — so the profile, streak, and history already tied to that id
+  carry over untouched. Requires "Allow manual linking" enabled in the
+  Supabase dashboard (Authentication > Settings).
+*/
+export function linkGoogleAccount() {
+  const redirectTo = window.location.origin + window.location.pathname;
+  return supabase.auth.linkIdentity({ provider: "google", options: { redirectTo } });
+}
+
+export async function getAccountInfo() {
+  const { data, error } = await supabase.auth.getUser();
+  if (error || !data.user) return null;
+  return { isGuest: !!data.user.is_anonymous, email: data.user.email || null };
+}
+
+export async function signOut() {
+  await supabase.auth.signOut();
 }
 
 function historyFromSubmissions(rows) {
@@ -48,7 +87,7 @@ function shapeProfile(row, history) {
 
 // Returns null when this visitor has never picked a name yet.
 export async function loadProfile() {
-  const user = await requireUser();
+  const user = await currentUser();
 
   const [{ data: profileRow, error: profileError }, { data: submissionRows, error: submissionError }] =
     await Promise.all([
@@ -67,7 +106,7 @@ export async function loadProfile() {
 }
 
 export async function createProfile(name) {
-  const user = await requireUser();
+  const user = await currentUser();
   const { data, error } = await supabase
     .from("profiles")
     .insert({ id: user.id, name, streak: 0, best_streak: 0, theme: "light" })
@@ -79,7 +118,7 @@ export async function createProfile(name) {
 }
 
 export async function updateProfile(patch) {
-  const user = await requireUser();
+  const user = await currentUser();
   const row = {};
   if (patch.name !== undefined) row.name = patch.name;
   if (patch.streak !== undefined) row.streak = patch.streak;
@@ -97,7 +136,7 @@ export async function updateProfile(patch) {
   state of each reaction button.
 */
 export async function loadFeed(dateStr) {
-  const user = await requireUser();
+  const user = await currentUser();
 
   const { data: submissionRows, error: submissionError } = await supabase
     .from("submissions")
@@ -141,7 +180,7 @@ export async function loadFeed(dateStr) {
 }
 
 export async function submitEntry({ name, dateStr, briefId, values, seconds, backfilled }) {
-  const user = await requireUser();
+  const user = await currentUser();
   const { error } = await supabase.from("submissions").upsert(
     {
       user_id: user.id,
@@ -160,7 +199,7 @@ export async function submitEntry({ name, dateStr, briefId, values, seconds, bac
 
 // Returns the new on/off state so the caller can update its own count.
 export async function toggleReaction(submissionId, tag, isOn) {
-  const user = await requireUser();
+  const user = await currentUser();
 
   if (isOn) {
     const { error } = await supabase
@@ -179,7 +218,7 @@ export async function toggleReaction(submissionId, tag, isOn) {
 }
 
 export async function sendFeedback({ type, text }) {
-  const user = await requireUser();
+  const user = await currentUser();
   const { error } = await supabase.from("feedback").insert({ user_id: user.id, type, text });
   if (error) throw error;
 }
