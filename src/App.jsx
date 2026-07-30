@@ -240,8 +240,14 @@ const THEME = {
   },
 };
 
+// Local calendar date, not UTC — parseDateStr/getDayIndex below both work in
+// local time, and toISOString() is UTC, so using it here meant the "day"
+// silently rolled over at UTC midnight instead of the visitor's own midnight.
 function getDateStr(d = new Date()) {
-  return d.toISOString().slice(0, 10);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
 /*
@@ -255,9 +261,10 @@ function consumeAuthRedirectError() {
   const params = new URLSearchParams(window.location.search || window.location.hash.replace(/^#/, ""));
   const description = params.get("error_description");
   if (!description) return null;
+  const code = params.get("error_code");
   const clean = window.location.origin + window.location.pathname;
   window.history.replaceState(null, "", clean);
-  return description.replace(/\+/g, " ");
+  return { message: description.replace(/\+/g, " "), code };
 }
 function parseDateStr(s) {
   const [y, m, d] = s.split("-").map(Number);
@@ -297,6 +304,11 @@ export default function DailyBriefApp() {
   const [feedLoading, setFeedLoading] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState("");
+  // True specifically when a "save progress with Google" attempt failed
+  // because that Google account already belongs to a different profile —
+  // the fix isn't retrying the link, it's signing into the account that
+  // already exists.
+  const [authConflict, setAuthConflict] = useState(false);
 
   const [menuOpen, setMenuOpen] = useState(false);
   const [feedbackType, setFeedbackType] = useState("bug");
@@ -348,6 +360,7 @@ export default function DailyBriefApp() {
       }
     } catch (e) {
       setError(e?.message || "Couldn't reach the server.");
+      setAuthConflict(false);
     } finally {
       setLoading(false);
       setNeedsAuthChoice(false);
@@ -361,7 +374,10 @@ export default function DailyBriefApp() {
     (async () => {
       try {
         const redirectError = consumeAuthRedirectError();
-        if (redirectError) setError(redirectError);
+        if (redirectError) {
+          setError(redirectError.message);
+          setAuthConflict(redirectError.code === "identity_already_exists");
+        }
 
         const user = await getExistingUser();
         if (!user) {
@@ -372,6 +388,7 @@ export default function DailyBriefApp() {
         await afterAuth();
       } catch (e) {
         setError(e?.message || "Couldn't reach the server.");
+        setAuthConflict(false);
         setLoading(false);
       }
     })();
@@ -380,23 +397,36 @@ export default function DailyBriefApp() {
 
   const chooseGuest = async () => {
     setError("");
+    setAuthConflict(false);
     setLoading(true);
     try {
       await continueAsGuest();
       await afterAuth();
     } catch (e) {
       setError(e?.message || "Couldn't continue as guest.");
+      setAuthConflict(false);
       setLoading(false);
     }
   };
 
   const chooseGoogle = () => {
     setError("");
+    setAuthConflict(false);
     signInWithGoogle();
   };
 
   const upgradeToGoogle = () => {
     linkGoogleAccount();
+  };
+
+  // The fix for "this Google account already belongs to another profile":
+  // sign into that profile directly rather than trying to merge into it.
+  // This abandons whatever local guest session is currently active — its
+  // data isn't deleted, just no longer reachable from this browser.
+  const signInToExistingAccount = () => {
+    setError("");
+    setAuthConflict(false);
+    signInWithGoogle();
   };
 
   const handleSignOut = async () => {
@@ -417,6 +447,7 @@ export default function DailyBriefApp() {
     startRef.current = null;
     setElapsed(0);
     setError("");
+    setAuthConflict(false);
 
     const entry = profile?.history?.[viewDate];
     if (entry) {
@@ -442,6 +473,7 @@ export default function DailyBriefApp() {
       setNeedsName(false);
     } catch (e) {
       setError("Couldn't save that name. Check your connection and try again.");
+      setAuthConflict(false);
     }
   };
 
@@ -527,6 +559,7 @@ export default function DailyBriefApp() {
     } catch (e) {
       setProfile(profile);
       setError("Couldn't submit that. Check your connection and try again.");
+      setAuthConflict(false);
     }
   };
 
@@ -725,11 +758,27 @@ export default function DailyBriefApp() {
         </header>
 
         {error && (
-          <div className={`flex items-start justify-between gap-3 rounded-lg px-4 py-3 mb-6 text-sm ${t.notChip}`}>
-            <span>{error}</span>
-            <button onClick={() => setError("")} className="shrink-0 opacity-70 hover:opacity-100">
-              <X size={16} />
-            </button>
+          <div className={`rounded-lg px-4 py-3 mb-6 text-sm ${t.notChip}`}>
+            <div className="flex items-start justify-between gap-3">
+              <span>{error}</span>
+              <button
+                onClick={() => {
+                  setError("");
+                  setAuthConflict(false);
+                }}
+                className="shrink-0 opacity-70 hover:opacity-100"
+              >
+                <X size={16} />
+              </button>
+            </div>
+            {authConflict && (
+              <button
+                onClick={signInToExistingAccount}
+                className="mt-2 text-sm font-medium underline underline-offset-2"
+              >
+                Sign in with that Google account instead
+              </button>
+            )}
           </div>
         )}
 
